@@ -1,1 +1,14 @@
+__pycache__/
 .DS_Store
+
+# Composer dependencies (regenerate with: composer install)
+vendor/
+
+# Runtime state written by the app / lab into the docroot (bind-mounted)
+var/
+artifacts/
+php2shell_before.json
+php2shell_after.json
+
+# Safety net: webshells dropped by --mode write-invoke
+shell_*.php

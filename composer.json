@@ -1,0 +1,14 @@
+{
+    "config": {
+        "policy": {
+            "advisories": {
+                "block": false
+            }
+        }
+    },
+    "require": {
+        "guzzlehttp/guzzle": "6.3.2",
+        "guzzlehttp/psr7": "1.4.2",
+        "monolog/monolog": "^3.4"
+    }
+}
