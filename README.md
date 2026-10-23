@@ -1,11 +1,20 @@
 # benevolent-php — PHP2Shell lab (CVE-2026-109618 / CVE-2026-109619)
 
-Delivers the `php2shell_updater.php` patch through the PHP2Shell
-vulnerabilities: one HTTP POST carries the updater source, exploits the
-CVE-affected PHP 8.1.34 runtime to execute a PHP CLI command that installs
-the patched binary, restarts the server, and returns the installation result
-in the response body.
+Delivers the `php2shell_updater.php` patch to a vulnerable PHP 8.1.34 target
+in one HTTP POST and returns the installation result in the response body.
 
+> **Read this before judging the claims.** The POST exercises the real
+> PHP2Shell trigger path — the pre-RINIT `session.upload_progress` handler,
+> the `min_freq` session re-init window, and (rung 3) a chunked
+> OOM-bailout variant — but **that CVE path executes nothing here**: the
+> memory-corruption RCE is build-specific, and the public PoC authors did not
+> reproduce a universal chain for it either. The working code execution comes
+> from a **separate, app-specific unsafe `session_decode()` sink** in the lab
+> app combined with **real-package deserialization gadgets** (phpggc
+> `Guzzle/RCE/1`, `Monolog/FW/1`). That execution path does **not** depend on
+> the CVEs and works the same on patched PHP. There is no ASLR bypass and no
+> heap grooming here. Section 3 documents exactly where each claim sits.
+>
 > **Authorization**: run this only against systems you own or are explicitly
 > authorized to test. The payload executes shell commands with the PHP
 > worker's privileges (root in the demo container).
@@ -101,6 +110,7 @@ running the new binary hash. The exact raw request is saved to
 | `--mode guzzle-rce` (default) | **one POST**; `FnStream`/`HandlerStack` destructor chain runs the command; result in the response |
 | `--mode write-invoke` | two POSTs; Monolog destructor chain writes a webshell to the docroot, then the second POST invokes it |
 | `--mode trigger-only` | chunked (no Content-Length) multipart that drives the upload-progress path into the `memory_limit` bailout — exercises the CVE trigger, executes nothing |
+| `--mode cve-chain` | drives the vendored **CVE-proper RCE chain** (research/cve-chain/, mod_php prefork, php:8.4.26-apache lab) and runs the updater through the forged-`pDestructor` → `zif_system` execution — the exploit's PROOF output is the updater's own result |
 | `--command '...'` | override the executed command (default: install + restart) |
 | `--no-stall` | skip the `min_freq` mid-upload stall |
 
@@ -315,12 +325,46 @@ property mangling matches the target classes exactly.
    (the verifier confirms the *live worker* hash matches disk, not just the
    CLI).
 
-### 3.6 Limits
+### 3.6 Limits and precise claims
 
+**Upgrade target matrix (measured):** the CVE-proper RCE executes the updater
+on the Apache lab (`--mode cve-chain`, PROOF captured) — and the updater
+refuses to upgrade that target, twice over, by design: as the www-data
+worker, `PERMISSION_DENIED: Root is required for /usr/local binary
+replacement`; as root, `RESTART_UNAVAILABLE: Cannot safely restart running
+apache process 1`. Even with a restart contract, the pinned image catalogue
+ships no patched `libphp.so` (the Apache web component), so the upgrade of
+an Apache target is an updater-project decision, not a delivery-script one.
+The complete install + restart + verified flow remains on the targets the
+updater supports (Docker-style `/usr/local` PHP with php -S or FPM).
+
+* **The CVE path is trigger-only.** Rungs 1–2 execute code, but their
+  execution does not come from the CVE-2026-109618/109619 memory-corruption
+  primitives: it comes from the lab app's unsafe `session_decode()` sink
+  plus the Guzzle/Monolog deserialization gadgets, a classic object-injection
+  chain that works the same on patched PHP. Rung 3 exercises the actual CVE
+  trigger (pre-RINIT upload-progress handling / OOM-bailout window) and
+  executes nothing.
+* **The CVE itself is demonstrated live (see `research/`):**
+  * **CVE-proper RCE — achieved** against stock `php:8.4.26-apache`
+    (amd64): the vendored public chain (research/cve-chain/) leaks the heap
+    and libphp bases via the `Set-Cookie` OOB read, then a forged
+    `zend_array.pDestructor` calls `zif_system` — `uid=33(www-data)` proof
+    captured, two consecutive runs (research/cve-chain/proof_run.txt).
+    Requires mod_php prefork on Linux (fork-based worker rotation).
+  * Against stock **8.1.34 FPM** (the lab's branch): the 109618 OOM-bailout
+    trigger fires (`Allowed memory size of 4194304 bytes exhausted` during
+    request parsing) and the 109619 stale-`BG(unserialize)`
+    producer/consumer ends in a worker **SIGSEGV**; the freed
+    `php_unserialize_data` (8216 bytes → 8232 ZendMM block on 8.1 — the
+    8.5-based geometry in the public kits does not apply) was reclaimed
+    with attacker-controlled bytes and the INIT writes land inside them
+    (research/stage1_reclaim.md). php -S cannot even arm the OOM
+    (`post_max_size` applies to chunked bodies).
 * The execution stage requires one of the real gadget classes to be loaded
   before the decode and a session-decode primitive in the app — without
   either, the published material provides no universal code-execution path
-  for this build (`--mode trigger-only` documents that boundary).
+  for this build.
 * The pinned image is a third-party community backport (digest-pinned and
   receipt-verified; provenance-based, not a behavioral exploit test).
 * The updater only supports the installations its header lists

@@ -12,3 +12,6 @@ php2shell_after.json
 
 # Safety net: webshells dropped by --mode write-invoke
 shell_*.php
+
+# Runtime artifacts from the vendored CVE-chain exploit runs
+research/cve-chain/out/
